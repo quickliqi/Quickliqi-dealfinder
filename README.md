@@ -1,2 +1,1 @@
-# Quickliqi-dealfinder
-Real estate deals finder for wholesalers
+# Here are your Instructions
