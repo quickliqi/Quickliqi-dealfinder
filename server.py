@@ -2,7 +2,10 @@ from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Form, D
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+from database import get_session, init_db, engine
+from models_db import DealModel, SettingsModel
 import os
 import logging
 import json
@@ -13,8 +16,8 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 # Import models
-from models.deal import Deal, DealCreate, DealUpdate, DealStatusUpdate, Candidate
-from models.settings import Settings, SettingsUpdate
+from deal import Deal, DealCreate, DealUpdate, DealStatusUpdate, Candidate
+from settings import Settings, SettingsUpdate
 
 # Import services
 from services.calculations import FinancialCalculator
@@ -23,12 +26,6 @@ from services.serpapi_scanner import SerpApiScanner
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
-
-# Create the main app without a prefix
 app = FastAPI(title="QuickLiqi API", version="1.0.0")
 
 # Create a router with the /api prefix
@@ -42,19 +39,22 @@ scanner = SerpApiScanner()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def model_to_dict(model) -> Dict[str, Any]:
+    data = dict(model.__dict__)
+    data.pop("_sa_instance_state", None)
+    return data
+
 # Dependency to get settings
-async def get_settings() -> Settings:
+async def get_settings(session: AsyncSession = Depends(get_session)) -> Settings:
     """Get current buyer criteria settings, create default if none exist."""
-    settings_doc = await db.settings.find_one()
-    if not settings_doc:
-        # Create default settings
+    result = await session.execute(select(SettingsModel))
+    settings_row = result.scalars().first()
+    if not settings_row:
         default_settings = Settings()
-        await db.settings.insert_one(default_settings.dict())
+        session.add(SettingsModel(**default_settings.dict()))
+        await session.commit()
         return default_settings
-    else:
-        # Remove MongoDB _id field
-        settings_doc.pop('_id', None)
-        return Settings(**settings_doc)
+    return Settings(**model_to_dict(settings_row))
 
 # Helper function to recalculate deal metrics
 async def recalculate_deal_metrics(deal_data: Dict[str, Any], settings: Settings) -> Dict[str, Any]:
@@ -65,149 +65,133 @@ async def recalculate_deal_metrics(deal_data: Dict[str, Any], settings: Settings
 
 # Settings endpoints
 @api_router.get("/settings", response_model=Settings)
-async def get_buyer_criteria():
+async def get_buyer_criteria(session: AsyncSession = Depends(get_session)):
     """Get current buyer criteria settings."""
-    return await get_settings()
+    return await get_settings(session)
 
 @api_router.put("/settings", response_model=Settings)
-async def update_buyer_criteria(settings_update: SettingsUpdate):
+async def update_buyer_criteria(settings_update: SettingsUpdate, session: AsyncSession = Depends(get_session)):
     """Update buyer criteria settings and recalculate all deal metrics."""
-    current_settings = await get_settings()
-    
-    # Update settings with provided values
+    current_settings = await get_settings(session)
+
     update_data = settings_update.dict(exclude_unset=True)
     updated_settings = Settings(**{**current_settings.dict(), **update_data})
-    
-    # Save updated settings
-    await db.settings.update_one(
-        {},
-        {"$set": updated_settings.dict()},
-        upsert=True
-    )
-    
-    # Recalculate all existing deals
-    deals_cursor = db.deals.find()
-    async for deal_doc in deals_cursor:
-        deal_doc.pop('_id', None)
-        updated_deal = await recalculate_deal_metrics(deal_doc, updated_settings)
-        await db.deals.update_one(
-            {"id": deal_doc["id"]},
-            {"$set": updated_deal}
-        )
-    
+
+    result = await session.execute(select(SettingsModel))
+    settings_row = result.scalars().first()
+    if settings_row:
+        for key, value in updated_settings.dict().items():
+            setattr(settings_row, key, value)
+    else:
+        session.add(SettingsModel(**updated_settings.dict()))
+
+    deals_result = await session.execute(select(DealModel))
+    for deal_row in deals_result.scalars():
+        deal_dict = model_to_dict(deal_row)
+        updated_deal = await recalculate_deal_metrics(deal_dict, updated_settings)
+        for key, value in updated_deal.items():
+            if hasattr(deal_row, key):
+                setattr(deal_row, key, value)
+
+    await session.commit()
     logger.info("Settings updated and all deals recalculated")
     return updated_settings
 
 # Deals endpoints
 @api_router.get("/deals", response_model=List[Deal])
-async def get_deals(status: Optional[str] = None):
+async def get_deals(status: Optional[str] = None, session: AsyncSession = Depends(get_session)):
     """Get all deals, optionally filtered by status."""
-    query = {}
+    stmt = select(DealModel)
     if status:
-        query["status"] = status
-    
-    deals = []
-    async for deal_doc in db.deals.find(query).sort("created_at", -1):
-        deal_doc.pop('_id', None)
-        deals.append(Deal(**deal_doc))
-    
-    return deals
+        stmt = stmt.where(DealModel.status == status)
+    stmt = stmt.order_by(DealModel.created_at.desc())
+    result = await session.execute(stmt)
+    return [Deal(**model_to_dict(d)) for d in result.scalars().all()]
 
 @api_router.post("/deals", response_model=Deal)
-async def create_deal(deal_create: DealCreate):
+async def create_deal(deal_create: DealCreate, session: AsyncSession = Depends(get_session)):
     """Create a new deal from candidate or manual entry."""
-    settings = await get_settings()
-    
-    # Convert to dict and add defaults
+    settings = await get_settings(session)
+
     deal_data = deal_create.dict()
     deal_data["created_at"] = datetime.utcnow()
     deal_data["status"] = "New"
-    
-    # Set ARV estimate if not provided
+
     if not deal_data.get("arv_estimate"):
         deal_data["arv_estimate"] = deal_data["list_price"] * 1.3
-    
-    # Calculate opportunity score
+
     deal_data["opportunity_score"] = calculator.calculate_opportunity_score(deal_data)
-    
-    # Calculate financial metrics
     deal_data = await recalculate_deal_metrics(deal_data, settings)
-    
-    # Create Deal object to generate ID
+
     deal = Deal(**deal_data)
-    
-    # Save to database
-    await db.deals.insert_one(deal.dict())
-    
+    session.add(DealModel(**deal.dict()))
+    await session.commit()
+
     logger.info(f"Created new deal: {deal.address}")
     return deal
 
 @api_router.get("/deals/{deal_id}", response_model=Deal)
-async def get_deal(deal_id: str):
+async def get_deal(deal_id: str, session: AsyncSession = Depends(get_session)):
     """Get specific deal by ID."""
-    deal_doc = await db.deals.find_one({"id": deal_id})
-    if not deal_doc:
+    result = await session.execute(select(DealModel).where(DealModel.id == deal_id))
+    deal_row = result.scalars().first()
+    if not deal_row:
         raise HTTPException(status_code=404, detail="Deal not found")
-    
-    deal_doc.pop('_id', None)
-    return Deal(**deal_doc)
+
+    return Deal(**model_to_dict(deal_row))
 
 @api_router.put("/deals/{deal_id}", response_model=Deal)
-async def update_deal(deal_id: str, deal_update: DealUpdate):
+async def update_deal(deal_id: str, deal_update: DealUpdate, session: AsyncSession = Depends(get_session)):
     """Update deal and recalculate metrics."""
-    # Get existing deal
-    deal_doc = await db.deals.find_one({"id": deal_id})
-    if not deal_doc:
+    result = await session.execute(select(DealModel).where(DealModel.id == deal_id))
+    deal_row = result.scalars().first()
+    if not deal_row:
         raise HTTPException(status_code=404, detail="Deal not found")
-    
-    deal_doc.pop('_id', None)
-    
-    # Apply updates
+
     update_data = deal_update.dict(exclude_unset=True)
-    deal_data = {**deal_doc, **update_data}
-    
-    # Recalculate metrics if financial fields changed
-    financial_fields = {'arv_estimate', 'repair_estimate', 'monthly_rent', 'taxes_insurance_monthly', 'assignment_fee', 'financing_pref'}
+    for key, value in update_data.items():
+        setattr(deal_row, key, value)
+
+    financial_fields = {
+        'arv_estimate', 'repair_estimate', 'monthly_rent',
+        'taxes_insurance_monthly', 'assignment_fee', 'financing_pref'
+    }
     if any(field in update_data for field in financial_fields):
-        settings = await get_settings()
-        deal_data = await recalculate_deal_metrics(deal_data, settings)
-    
-    # Update in database
-    await db.deals.update_one(
-        {"id": deal_id},
-        {"$set": deal_data}
-    )
-    
+        settings = await get_settings(session)
+        deal_dict = model_to_dict(deal_row)
+        deal_dict = await recalculate_deal_metrics(deal_dict, settings)
+        for key, value in deal_dict.items():
+            if hasattr(deal_row, key):
+                setattr(deal_row, key, value)
+
+    await session.commit()
     logger.info(f"Updated deal: {deal_id}")
-    return Deal(**deal_data)
+    return Deal(**model_to_dict(deal_row))
 
 @api_router.patch("/deals/{deal_id}/status", response_model=Deal)
-async def update_deal_status(deal_id: str, status_update: DealStatusUpdate):
+async def update_deal_status(deal_id: str, status_update: DealStatusUpdate, session: AsyncSession = Depends(get_session)):
     """Update deal status (for pipeline drag-and-drop)."""
-    # Get existing deal
-    deal_doc = await db.deals.find_one({"id": deal_id})
-    if not deal_doc:
+    result = await session.execute(select(DealModel).where(DealModel.id == deal_id))
+    deal_row = result.scalars().first()
+    if not deal_row:
         raise HTTPException(status_code=404, detail="Deal not found")
-    
-    # Update status
-    await db.deals.update_one(
-        {"id": deal_id},
-        {"$set": {"status": status_update.status}}
-    )
-    
-    deal_doc.pop('_id', None)
-    deal_doc["status"] = status_update.status
-    
+
+    deal_row.status = status_update.status
+    await session.commit()
+
     logger.info(f"Updated deal status: {deal_id} -> {status_update.status}")
-    return Deal(**deal_doc)
+    return Deal(**model_to_dict(deal_row))
 
 @api_router.delete("/deals/{deal_id}")
-async def delete_deal(deal_id: str):
+async def delete_deal(deal_id: str, session: AsyncSession = Depends(get_session)):
     """Delete a deal."""
-    result = await db.deals.delete_one({"id": deal_id})
-    if result.deleted_count == 0:
+    result = await session.execute(select(DealModel).where(DealModel.id == deal_id))
+    deal_row = result.scalars().first()
+    if not deal_row:
         raise HTTPException(status_code=404, detail="Deal not found")
-    
+    await session.delete(deal_row)
+    await session.commit()
+
     logger.info(f"Deleted deal: {deal_id}")
     return {"message": "Deal deleted successfully"}
 
@@ -216,7 +200,8 @@ async def delete_deal(deal_id: str):
 async def import_csv(
     file: UploadFile = File(...),
     mapping: str = Form(...),
-    filters: str = Form(...)
+    filters: str = Form(...),
+    session: AsyncSession = Depends(get_session)
 ):
     """Process uploaded CSV file and return candidate properties."""
     if not file.filename.endswith('.csv'):
@@ -233,7 +218,7 @@ async def import_csv(
         csv_reader = csv.DictReader(io.StringIO(csv_content))
         
         candidates = []
-        settings = await get_settings()
+        settings = await get_settings(session)
         
         for row in csv_reader:
             try:
@@ -329,12 +314,10 @@ async def scan_market_opportunities(
 
 # Export endpoint
 @api_router.get("/export")
-async def export_deals():
+async def export_deals(session: AsyncSession = Depends(get_session)):
     """Export all deals to CSV format."""
-    deals = []
-    async for deal_doc in db.deals.find().sort("created_at", -1):
-        deal_doc.pop('_id', None)
-        deals.append(Deal(**deal_doc))
+    result = await session.execute(select(DealModel).order_by(DealModel.created_at.desc()))
+    deals = [Deal(**model_to_dict(d)) for d in result.scalars().all()]
     
     # Create CSV content
     output = io.StringIO()
@@ -387,36 +370,41 @@ async def export_deals():
 
 # Recalculate metrics endpoint
 @api_router.post("/calculate-metrics")
-async def recalculate_all_metrics():
+async def recalculate_all_metrics(session: AsyncSession = Depends(get_session)):
     """Recalculate financial metrics for all deals based on current settings."""
-    settings = await get_settings()
+    settings = await get_settings(session)
     updated_count = 0
-    
-    async for deal_doc in db.deals.find():
+
+    result = await session.execute(select(DealModel))
+    for deal_row in result.scalars():
         try:
-            deal_doc.pop('_id', None)
-            updated_deal = await recalculate_deal_metrics(deal_doc, settings)
-            
-            await db.deals.update_one(
-                {"id": deal_doc["id"]},
-                {"$set": updated_deal}
-            )
+            deal_dict = model_to_dict(deal_row)
+            updated_deal = await recalculate_deal_metrics(deal_dict, settings)
+            for key, value in updated_deal.items():
+                if hasattr(deal_row, key):
+                    setattr(deal_row, key, value)
             updated_count += 1
         except Exception as e:
-            logger.error(f"Error recalculating deal {deal_doc.get('id', 'unknown')}: {e}")
-    
+            logger.error(f"Error recalculating deal {deal_row.id}: {e}")
+
+    await session.commit()
     logger.info(f"Recalculated metrics for {updated_count} deals")
     return {"message": f"Recalculated metrics for {updated_count} deals"}
 
 # Health check endpoint
 @api_router.get("/health")
-async def health_check():
+async def health_check(session: AsyncSession = Depends(get_session)):
     """Health check endpoint."""
+    try:
+        await session.execute(text("SELECT 1"))
+        db_status = "connected"
+    except Exception:
+        db_status = "error"
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow(),
         "serpapi_enabled": scanner.is_enabled(),
-        "database": "connected"
+        "database": db_status,
     }
 
 # Legacy root endpoint
@@ -435,6 +423,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+async def on_startup():
+    await init_db()
+
+
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    await engine.dispose()
