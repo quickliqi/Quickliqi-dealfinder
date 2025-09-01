@@ -1,6 +1,4 @@
-import math
 from typing import Dict, Any
-from models.deal import Deal
 from models.settings import Settings
 
 class FinancialCalculator:
