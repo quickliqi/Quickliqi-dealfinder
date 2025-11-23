@@ -5,7 +5,7 @@ from typing import List, Dict, Any
 from urllib.parse import urlparse, parse_qs
 import logging
 from models.deal import Candidate
-from services.calculations import FinancialCalculator
+from .calculations import FinancialCalculator
 
 logger = logging.getLogger(__name__)
 
